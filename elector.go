@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +35,24 @@ type Elector interface {
 // --- 1. Active-Passive Strategy ---
 
 type activePassiveElector struct {
+	lease *leaseElector
+}
+
+func NewActivePassiveElector(client kubernetes.Interface, ns, name, id string) Elector {
+	return &activePassiveElector{
+		lease: newLeaseElector(client, ns, name, id),
+	}
+}
+
+func (e *activePassiveElector) Start(ctx context.Context) error {
+	return e.lease.Start(ctx)
+}
+
+func (e *activePassiveElector) IsLeader(_ string) bool {
+	return e.lease.IsLeader()
+}
+
+type leaseElector struct {
 	client    kubernetes.Interface
 	namespace string
 	leaseName string
@@ -43,16 +60,29 @@ type activePassiveElector struct {
 	isLeader  atomic.Bool
 }
 
-func NewActivePassiveElector(client kubernetes.Interface, ns, name, id string) Elector {
-	return &activePassiveElector{
+func newLeaseElector(client kubernetes.Interface, namespace, leaseName, identity string) *leaseElector {
+	return &leaseElector{
 		client:    client,
-		namespace: ns,
-		leaseName: name,
-		identity:  id,
+		namespace: namespace,
+		leaseName: leaseName,
+		identity:  identity,
 	}
 }
 
-func (e *activePassiveElector) Start(ctx context.Context) error {
+func (e *leaseElector) Start(ctx context.Context) error {
+	if e.client == nil {
+		return fmt.Errorf("client cannot be nil")
+	}
+	if e.namespace == "" {
+		return fmt.Errorf("namespace cannot be empty")
+	}
+	if e.leaseName == "" {
+		return fmt.Errorf("leaseName cannot be empty")
+	}
+	if e.identity == "" {
+		return fmt.Errorf("identity cannot be empty")
+	}
+
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      e.leaseName,
@@ -89,7 +119,7 @@ func (e *activePassiveElector) Start(ctx context.Context) error {
 	return nil
 }
 
-func (e *activePassiveElector) IsLeader(_ string) bool {
+func (e *leaseElector) IsLeader() bool {
 	return e.isLeader.Load()
 }
 
@@ -98,50 +128,64 @@ func (e *activePassiveElector) IsLeader(_ string) bool {
 type shardedElector struct {
 	totalBuckets uint32
 	myBucketID   uint32
+	lease        *leaseElector
 }
 
-func NewShardedElector(totalBuckets, myBucketID uint32) Elector {
+func NewShardedElector(client kubernetes.Interface, ns, lockPrefix, id string, totalBuckets, myBucketID uint32) Elector {
+	leaseName := fmt.Sprintf("%s-%d", lockPrefix, myBucketID)
 	return &shardedElector{
 		totalBuckets: totalBuckets,
 		myBucketID:   myBucketID,
+		lease:        newLeaseElector(client, ns, leaseName, id),
 	}
 }
 
 func (e *shardedElector) Start(ctx context.Context) error {
-	// Static sharding requires no background coordination loop.
-	// (Dynamic lease-based sharding would combine this with ActivePassive logic per bucket).
-	return nil
+	if e.totalBuckets == 0 {
+		return fmt.Errorf("totalBuckets must be greater than 0")
+	}
+	if e.myBucketID >= e.totalBuckets {
+		return fmt.Errorf("myBucketID (%d) must be less than totalBuckets (%d)", e.myBucketID, e.totalBuckets)
+	}
+	return e.lease.Start(ctx)
 }
 
 func (e *shardedElector) IsLeader(key string) bool {
 	if e.totalBuckets == 0 {
 		return false
 	}
+	if e.myBucketID >= e.totalBuckets {
+		return false
+	}
+	bucket := bucketForKey(key, e.totalBuckets)
+	return bucket == e.myBucketID && e.lease.IsLeader()
+}
+
+func bucketForKey(key string, totalBuckets uint32) uint32 {
 	h := fnv.New32a()
-	h.Write([]byte(key))
-	bucket := h.Sum32() % e.totalBuckets
-	return bucket == e.myBucketID
+	_, _ = h.Write([]byte(key))
+	return h.Sum32() % totalBuckets
 }
 
 // --- 3. StatefulSet Deterministic Strategy ---
 
 type statefulSetElector struct {
-	leaderOrdinal string
+	lease *leaseElector
 }
 
-func NewStatefulSetElector(leaderOrdinal string) Elector {
+func NewStatefulSetElector(client kubernetes.Interface, ns, leaseName, identity string) Elector {
+	if identity == "" {
+		identity = os.Getenv("HOSTNAME")
+	}
 	return &statefulSetElector{
-		leaderOrdinal: leaderOrdinal, // usually "0"
+		lease: newLeaseElector(client, ns, leaseName, identity),
 	}
 }
 
 func (e *statefulSetElector) Start(ctx context.Context) error {
-	// No background API communication required.
-	return nil
+	return e.lease.Start(ctx)
 }
 
 func (e *statefulSetElector) IsLeader(_ string) bool {
-	hostname := os.Getenv("HOSTNAME")
-	// e.g., if hostname is "my-operator-0" and leaderOrdinal is "0"
-	return strings.HasSuffix(hostname, "-"+e.leaderOrdinal)
+	return e.lease.IsLeader()
 }
