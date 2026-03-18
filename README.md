@@ -16,7 +16,7 @@ flowchart TD
     A[Start elector] --> B[Acquire single Lease]
     B -->|won lease| C[Leader = true]
     B -->|lost lease| D[Leader = false]
-    C --> E[Process all keys]
+    C --> E[Operator - Process all objects]
     D --> F[Standby]
 ```
 
@@ -37,6 +37,8 @@ flowchart TD
     C -->|yes| E[Check shard Lease ownership]
     E -->|owns lease| F[Leader for key]
     E -->|does not own lease| G[Not leader for key]
+    F --> H[Operator - Process object]
+    G --> I[Standby]
 ```
 
 ### 3) StatefulSet (Lease-based)
@@ -55,6 +57,8 @@ flowchart TD
     C -->|lost lease| E[Leader = false]
     D --> F[Active instance]
     E --> G[Standby instance]
+    F --> H[Operator - Process object]
+    G --> I[Standby]
 ```
 
 ## Source Map
