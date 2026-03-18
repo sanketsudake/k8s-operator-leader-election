@@ -49,7 +49,7 @@ StatefulSet pods still use Kubernetes Lease election for realistic failover (not
 
 ```mermaid
 flowchart TD
-    A[Start pod] --> B[Resolve identity (arg or HOSTNAME)]
+    A[Start pod] --> B["Resolve identity (arg or HOSTNAME)"]
     B --> C[Compete for shared Lease]
     C -->|won lease| D[Leader = true]
     C -->|lost lease| E[Leader = false]
