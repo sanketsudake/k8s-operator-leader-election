@@ -123,42 +123,70 @@ func (e *leaseElector) IsLeader() bool {
 	return e.isLeader.Load()
 }
 
-// --- 2. Sharded Strategy ---
-
-type shardedElector struct {
-	totalBuckets uint32
-	myBucketID   uint32
-	lease        *leaseElector
+// ShardOwner is an optional interface implemented by sharded electors
+// to expose which buckets the current instance owns.
+type ShardOwner interface {
+	OwnedBuckets() []uint32
 }
 
-func NewShardedElector(client kubernetes.Interface, ns, lockPrefix, id string, totalBuckets, myBucketID uint32) Elector {
-	leaseName := fmt.Sprintf("%s-%d", lockPrefix, myBucketID)
-	return &shardedElector{
+// --- 2. Dynamic Sharded Strategy ---
+//
+// Each pod competes for ALL N bucket leases. A pod becomes leader for
+// bucket B when it wins lease "<lockPrefix>-B". This means:
+//
+//   - M = N pods: each pod wins ~1 bucket (steady state).
+//   - M < N pods: some pods hold multiple buckets.
+//   - M > N pods: at most N pods are active leaders; extras are hot-standby.
+//
+// On pod crash/scale-down the Kubernetes lease expires and a surviving
+// pod acquires it automatically — no external rebalance controller needed.
+
+type dynamicShardedElector struct {
+	totalBuckets uint32
+	leases       []*leaseElector
+}
+
+func NewDynamicShardedElector(client kubernetes.Interface, ns, lockPrefix, id string, totalBuckets uint32) Elector {
+	leases := make([]*leaseElector, totalBuckets)
+	for i := range totalBuckets {
+		leaseName := fmt.Sprintf("%s-%d", lockPrefix, i)
+		leases[i] = newLeaseElector(client, ns, leaseName, id)
+	}
+	return &dynamicShardedElector{
 		totalBuckets: totalBuckets,
-		myBucketID:   myBucketID,
-		lease:        newLeaseElector(client, ns, leaseName, id),
+		leases:       leases,
 	}
 }
 
-func (e *shardedElector) Start(ctx context.Context) error {
+func (e *dynamicShardedElector) Start(ctx context.Context) error {
 	if e.totalBuckets == 0 {
 		return fmt.Errorf("totalBuckets must be greater than 0")
 	}
-	if e.myBucketID >= e.totalBuckets {
-		return fmt.Errorf("myBucketID (%d) must be less than totalBuckets (%d)", e.myBucketID, e.totalBuckets)
+	for i, l := range e.leases {
+		if err := l.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start lease for bucket %d: %w", i, err)
+		}
 	}
-	return e.lease.Start(ctx)
+	return nil
 }
 
-func (e *shardedElector) IsLeader(key string) bool {
+func (e *dynamicShardedElector) IsLeader(key string) bool {
 	if e.totalBuckets == 0 {
 		return false
 	}
-	if e.myBucketID >= e.totalBuckets {
-		return false
-	}
 	bucket := bucketForKey(key, e.totalBuckets)
-	return bucket == e.myBucketID && e.lease.IsLeader()
+	return e.leases[bucket].IsLeader()
+}
+
+// OwnedBuckets returns the list of bucket IDs this pod currently leads.
+func (e *dynamicShardedElector) OwnedBuckets() []uint32 {
+	var owned []uint32
+	for i, l := range e.leases {
+		if l.IsLeader() {
+			owned = append(owned, uint32(i))
+		}
+	}
+	return owned
 }
 
 func bucketForKey(key string, totalBuckets uint32) uint32 {

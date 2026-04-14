@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leader-demo-sharded
+  namespace: default
+  labels:
+    app: leader-demo
+    strategy: sharded
+spec:
+  # Start with 3 replicas and 4 buckets (M < N).
+  # Scale to 4 for M = N, or 6 for M > N:
+  #   kubectl scale deploy leader-demo-sharded --replicas=4
+  #   kubectl scale deploy leader-demo-sharded --replicas=6
+  replicas: 3
+  selector:
+    matchLabels:
+      app: leader-demo
+      strategy: sharded
+  template:
+    metadata:
+      labels:
+        app: leader-demo
+        strategy: sharded
+    spec:
+      serviceAccountName: leader-demo
+      containers:
+        - name: demo
+          image: leader-demo:local
+          imagePullPolicy: Never
+          env:
+            - name: STRATEGY
+              value: "sharded"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LEASE_PREFIX
+              value: "shard-lock"
+            - name: TOTAL_BUCKETS
+              value: "4"
